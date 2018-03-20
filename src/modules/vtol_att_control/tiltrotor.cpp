@@ -42,8 +42,6 @@
 #include "tiltrotor.h"
 #include "vtol_att_control_main.h"
 
-#define ARSP_YAW_CTRL_DISABLE 7.0f	// airspeed at which we stop controlling yaw during a front transition
-
 Tiltrotor::Tiltrotor(VtolAttitudeControl *attc) :
 	VtolType(attc),
 	_rear_motors(ENABLED),
@@ -54,8 +52,8 @@ Tiltrotor::Tiltrotor(VtolAttitudeControl *attc) :
 	_vtol_schedule.transition_start = 0;
 
 	_mc_roll_weight = 1.0f;
-	_mc_pitch_weight = 1.0f;
-	_mc_yaw_weight = 1.0f;
+
+
 
 	_flag_was_in_trans_mode = false;
 
@@ -66,7 +64,6 @@ Tiltrotor::Tiltrotor(VtolAttitudeControl *attc) :
 	_params_handles_tiltrotor.tilt_fw = param_find("VT_TILT_FW");
 	_params_handles_tiltrotor.airspeed_trans = param_find("VT_ARSP_TRANS");
 	_params_handles_tiltrotor.airspeed_blend_start = param_find("VT_ARSP_BLEND");
-	_params_handles_tiltrotor.elevons_mc_lock = param_find("VT_ELEV_MC_LOCK");
 	_params_handles_tiltrotor.front_trans_dur_p2 = param_find("VT_TRANS_P2_DUR");
 	_params_handles_tiltrotor.fw_motors_off = param_find("VT_FW_MOT_OFFID");
 	_params_handles_tiltrotor.airspeed_disabled = param_find("FW_ARSP_MODE");
@@ -116,10 +113,6 @@ Tiltrotor::parameters_update()
 	/* vtol airspeed at which we start blending mc/fw controls */
 	param_get(_params_handles_tiltrotor.airspeed_blend_start, &v);
 	_params_tiltrotor.airspeed_blend_start = v;
-
-	/* vtol lock elevons in multicopter */
-	param_get(_params_handles_tiltrotor.elevons_mc_lock, &l);
-	_params_tiltrotor.elevons_mc_lock = l;
 
 	/* vtol front transition phase 2 duration */
 	param_get(_params_handles_tiltrotor.front_trans_dur_p2, &v);
@@ -337,16 +330,14 @@ void Tiltrotor::update_transition_state()
 
 		// at low speeds give full weight to MC
 		_mc_roll_weight = 1.0f;
-		_mc_yaw_weight = 1.0f;
 
-		// reduce MC controls once the plane has picked up speed
-		if (use_airspeed && _airspeed->indicated_airspeed_m_s > ARSP_YAW_CTRL_DISABLE) {
-			_mc_yaw_weight = 0.0f;
-		}
+
 
 		if (use_airspeed && _airspeed->indicated_airspeed_m_s >= _params_tiltrotor.airspeed_blend_start) {
 			_mc_roll_weight = 1.0f - (_airspeed->indicated_airspeed_m_s - _params_tiltrotor.airspeed_blend_start) /
 					  (_params_tiltrotor.airspeed_trans - _params_tiltrotor.airspeed_blend_start);
+					  
+
 		}
 
 		// without airspeed do timed weight changes
@@ -354,7 +345,7 @@ void Tiltrotor::update_transition_state()
 		    && (float)hrt_elapsed_time(&_vtol_schedule.transition_start) > (_params->front_trans_time_min * 1e6f)) {
 			_mc_roll_weight = 1.0f - ((float)hrt_elapsed_time(&_vtol_schedule.transition_start) - _params->front_trans_time_min *
 						  1e6f) / (_params->front_trans_time_openloop * 1e6f - _params->front_trans_time_min * 1e6f);
-			_mc_yaw_weight = _mc_roll_weight;
+
 		}
 
 		_thrust_transition = _mc_virtual_att_sp->thrust;
@@ -366,7 +357,7 @@ void Tiltrotor::update_transition_state()
 					&_vtol_schedule.transition_start) / (_params_tiltrotor.front_trans_dur_p2 * 1000000.0f);
 
 		_mc_roll_weight = 0.0f;
-		_mc_yaw_weight = 0.0f;
+
 
 		// ramp down rear motors (setting MAX_PWM down scales the given output into the new range)
 		int rear_value = (1.0f - (float)hrt_elapsed_time(&_vtol_schedule.transition_start) /
@@ -396,13 +387,16 @@ void Tiltrotor::update_transition_state()
 
 		// set zero throttle for backtransition otherwise unwanted moments will be created
 		_actuators_mc_in->control[actuator_controls_s::INDEX_THROTTLE] = 0.0f;
+		_actuators_fw_in->control[actuator_controls_s::INDEX_THROTTLE] = 0.0f;
+		
+		//Transition mixer weighting according to the precentage of time completion
+		_mc_roll_weight = 0.0f;// + (float)hrt_elapsed_time(&_vtol_schedule.transition_start) / (_params_tiltrotor.back_trans_dur * 1000000.0f);
 
-		_mc_roll_weight = 0.0f;
 
 	}
 
 	_mc_roll_weight = math::constrain(_mc_roll_weight, 0.0f, 1.0f);
-	_mc_yaw_weight = math::constrain(_mc_yaw_weight, 0.0f, 1.0f);
+
 
 	// copy virtual attitude setpoint to real attitude setpoint (we use multicopter att sp)
 	memcpy(_v_att_sp, _mc_virtual_att_sp, sizeof(vehicle_attitude_setpoint_s));
@@ -419,36 +413,35 @@ void Tiltrotor::waiting_on_tecs()
 */
 void Tiltrotor::fill_actuator_outputs()
 {
+
+        //Simple MC commands (timestamp, pitch, yaw)
 	_actuators_out_0->timestamp = _actuators_mc_in->timestamp;
-	_actuators_out_0->control[actuator_controls_s::INDEX_ROLL] = _actuators_mc_in->control[actuator_controls_s::INDEX_ROLL]
-			* _mc_roll_weight;
-	_actuators_out_0->control[actuator_controls_s::INDEX_PITCH] =
-		_actuators_mc_in->control[actuator_controls_s::INDEX_PITCH] * _mc_pitch_weight;
-	_actuators_out_0->control[actuator_controls_s::INDEX_YAW] = _actuators_mc_in->control[actuator_controls_s::INDEX_YAW] *
-			_mc_yaw_weight;
+	_actuators_out_0->control[actuator_controls_s::INDEX_PITCH] = _actuators_mc_in->control[actuator_controls_s::INDEX_PITCH] * _mc_roll_weight;
+        _actuators_out_0->control[actuator_controls_s::INDEX_YAW]   = _actuators_mc_in->control[actuator_controls_s::INDEX_YAW]   * _mc_roll_weight;
+		
+        //Simple FW commands (timestamp, roll, pitch, conventional yaw)
+        _actuators_out_1->timestamp = _actuators_fw_in->timestamp;
+        _actuators_out_1->control[actuator_controls_s::INDEX_ROLL]  = -_actuators_fw_in->control[actuator_controls_s::INDEX_ROLL] * (1.0f - _mc_roll_weight);
+        _actuators_out_1->control[actuator_controls_s::INDEX_PITCH] = ((_actuators_fw_in->control[actuator_controls_s::INDEX_PITCH] + _params->fw_pitch_trim))* (1.0f - _mc_roll_weight);
+        _actuators_out_1->control[actuator_controls_s::INDEX_YAW]   = _actuators_fw_in->control[actuator_controls_s::INDEX_YAW];
 
-	if (_vtol_schedule.flight_mode == FW_MODE) {
-		_actuators_out_0->control[actuator_controls_s::INDEX_THROTTLE] =
-			_actuators_fw_in->control[actuator_controls_s::INDEX_THROTTLE];
 
-		/* allow differential thrust if enabled */
-		if (_params_tiltrotor.diff_thrust == 1) {
-			_actuators_out_0->control[actuator_controls_s::INDEX_ROLL] =
-				_actuators_fw_in->control[actuator_controls_s::INDEX_YAW] * _params_tiltrotor.diff_thrust_scale;
-		}
+        //MC ROLL & FW YAW (using differential thrust)
+        //Weight according to the present flight mode and differential thrust scaling.
+        //Multiply FW yaw by diff_thrust, so that if it is disabled it will have no effect on the actuator.
+        _actuators_out_0->control[actuator_controls_s::INDEX_ROLL] = _actuators_mc_in->control[actuator_controls_s::INDEX_ROLL]* _mc_roll_weight +
+                                                                     _actuators_fw_in->control[actuator_controls_s::INDEX_YAW]* _params_tiltrotor.diff_thrust_scale* (1.0f - _mc_roll_weight)*(_params_tiltrotor.diff_thrust);
 
-	} else {
-		_actuators_out_0->control[actuator_controls_s::INDEX_THROTTLE] =
-			_actuators_mc_in->control[actuator_controls_s::INDEX_THROTTLE];
-	}
 
-	_actuators_out_1->timestamp = _actuators_fw_in->timestamp;
-	_actuators_out_1->control[actuator_controls_s::INDEX_ROLL] =
-		-_actuators_fw_in->control[actuator_controls_s::INDEX_ROLL];
-	_actuators_out_1->control[actuator_controls_s::INDEX_PITCH] =
-		(_actuators_fw_in->control[actuator_controls_s::INDEX_PITCH] + _params->fw_pitch_trim);
-	_actuators_out_1->control[actuator_controls_s::INDEX_YAW] =
-		_actuators_fw_in->control[actuator_controls_s::INDEX_YAW];	// yaw
+        //THROTTLE
+
+        //Mix MC and FW  thrust inputs depending on Flight mode status
+        _actuators_out_0->control[actuator_controls_s::INDEX_THROTTLE] = _actuators_mc_in->control[actuator_controls_s::INDEX_THROTTLE]*_mc_roll_weight +
+                                                                         _actuators_fw_in->control[actuator_controls_s::INDEX_THROTTLE]*(1.0f - _mc_roll_weight);
+
+
+
+        //TILT SERVO
 	_actuators_out_1->control[4] = _tilt_control;
 }
 
